@@ -157,11 +157,14 @@ function findFirstNonExistentComponent(targetPath: string): string {
 }
 
 /**
- * Get mandatory deny paths using ripgrep (Linux only).
+ * Get mandatory deny paths using ripgrep.
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ *
+ * Despite the name, this is platform-agnostic (uses path.sep/path.resolve) and
+ * is also used by the Windows backend, which similarly needs literal paths for ACLs.
  */
-async function linuxGetMandatoryDenyPaths(
+export async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,

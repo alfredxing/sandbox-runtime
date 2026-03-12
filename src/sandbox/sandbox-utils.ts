@@ -1,4 +1,4 @@
-import { homedir } from 'os'
+import { homedir, tmpdir as osTmpdir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
@@ -277,6 +277,16 @@ export function normalizePathForSandbox(pathPattern: string): string {
  */
 export function getDefaultWritePaths(): string[] {
   const homeDir = homedir()
+
+  if (getPlatform() === 'windows') {
+    return [
+      path.join(osTmpdir(), 'claude'),
+      path.join(homeDir, '.npm', '_logs'),
+      path.join(homeDir, '.claude', 'debug'),
+      path.join(homeDir, 'AppData', 'Local', 'npm-cache', '_logs'),
+    ]
+  }
+
   const recommendedPaths = [
     '/dev/stdout',
     '/dev/stderr',
@@ -300,9 +310,20 @@ export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
 ): string[] {
-  // Respect CLAUDE_TMPDIR if set, otherwise default to /tmp/claude
-  const tmpdir = process.env.CLAUDE_TMPDIR || '/tmp/claude'
-  const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=${tmpdir}`]
+  const platform = getPlatform()
+
+  // Respect CLAUDE_TMPDIR if set, otherwise default to a platform-appropriate temp dir
+  const tmpdir =
+    process.env.CLAUDE_TMPDIR ||
+    (platform === 'windows' ? path.join(osTmpdir(), 'claude') : '/tmp/claude')
+
+  const envVars: string[] = [`SANDBOX_RUNTIME=1`]
+  if (platform === 'windows') {
+    // Windows programs read TEMP and TMP, not TMPDIR
+    envVars.push(`TEMP=${tmpdir}`, `TMP=${tmpdir}`)
+  } else {
+    envVars.push(`TMPDIR=${tmpdir}`)
+  }
 
   // If no proxy ports provided, return minimal env vars
   if (!httpProxyPort && !socksProxyPort) {
@@ -337,8 +358,9 @@ export function generateProxyEnvVars(
     envVars.push(`ALL_PROXY=socks5h://localhost:${socksProxyPort}`)
     envVars.push(`all_proxy=socks5h://localhost:${socksProxyPort}`)
 
-    // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox
-    const platform = getPlatform()
+    // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox.
+    // Windows: no nc/socat equivalent ships by default. Git over HTTPS works via HTTPS_PROXY
+    // above; SSH-protocol git URLs are not proxied on Windows.
     if (platform === 'macos') {
       // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x)
       envVars.push(

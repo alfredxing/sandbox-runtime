@@ -26,6 +26,12 @@ import {
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
+  wrapCommandWithSandboxWindows,
+  checkWindowsDependencies,
+  sweepStaleAppContainerState,
+  cleanupWindowsConfigFiles,
+} from './windows-sandbox-utils.js'
+import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
@@ -279,11 +285,17 @@ async function initialize(
 
       // Initialize platform-specific infrastructure
       let linuxBridge: LinuxNetworkBridgeContext | undefined
-      if (getPlatform() === 'linux') {
+      const platform = getPlatform()
+      if (platform === 'linux') {
         linuxBridge = await initializeLinuxNetworkBridge(
           httpProxyPort,
           socksProxyPort,
         )
+      } else if (platform === 'windows') {
+        // Crash recovery: revoke leftover ACLs from any prior srt run that
+        // died before cleanup. Stale ACLs refer to SIDs that will never be
+        // used again, so they're harmless — but they accumulate as clutter.
+        sweepStaleAppContainerState()
       }
 
       const context: HostNetworkManagerContext = {
@@ -316,7 +328,7 @@ function isSupportedPlatform(): boolean {
     // WSL1 doesn't support bubblewrap
     return getWslVersion() !== '1'
   }
-  return platform === 'macos'
+  return platform === 'macos' || platform === 'windows'
 }
 
 function isSandboxingEnabled(): boolean {
@@ -351,6 +363,10 @@ function checkDependencies(ripgrepConfig?: {
     const linuxDeps = checkLinuxDependencies(config?.seccomp)
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
+  } else if (platform === 'windows') {
+    const winDeps = checkWindowsDependencies()
+    errors.push(...winDeps.errors)
+    warnings.push(...winDeps.warnings)
   }
 
   return { errors, warnings }
@@ -636,6 +652,20 @@ async function wrapWithSandbox(
         abortSignal,
       })
 
+    case 'windows':
+      return wrapCommandWithSandboxWindows({
+        command,
+        needsNetworkRestriction,
+        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        readConfig,
+        writeConfig,
+        allowGitConfig: getAllowGitConfig(),
+        ripgrepConfig: getRipgrepConfig(),
+        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        abortSignal,
+      })
+
     default:
       // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
       throw new Error(
@@ -674,6 +704,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  */
 function cleanupAfterCommand(): void {
   cleanupBwrapMountPoints()
+  cleanupWindowsConfigFiles()
 }
 
 async function reset(): Promise<void> {
