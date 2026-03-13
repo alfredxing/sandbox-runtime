@@ -548,7 +548,24 @@ struct BridgeShuttle {
     SOCKET sock;
     HANDLE pipe;
     bool pipeToSock;
+    HANDLE ovlEvent;  // per-shuttle event for OVERLAPPED pipe I/O
 };
+
+// Synchronous-looking read/write over an OVERLAPPED pipe. Each shuttle
+// owns its own event so a pending ReadFile in one shuttle doesn't block
+// a WriteFile in the sibling.
+static bool ovlReadPipe(HANDLE pipe, HANDLE ev, char* buf, DWORD cap, DWORD* n) {
+    OVERLAPPED ovl = {}; ovl.hEvent = ev;
+    BOOL ok = ReadFile(pipe, buf, cap, nullptr, &ovl);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) return false;
+    return GetOverlappedResult(pipe, &ovl, n, TRUE) && *n > 0;
+}
+static bool ovlWritePipe(HANDLE pipe, HANDLE ev, const char* buf, DWORD len, DWORD* w) {
+    OVERLAPPED ovl = {}; ovl.hEvent = ev;
+    BOOL ok = WriteFile(pipe, buf, len, nullptr, &ovl);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) return false;
+    return GetOverlappedResult(pipe, &ovl, w, TRUE);
+}
 
 static unsigned __stdcall bridgeShuttle(void* argp) {
     BridgeShuttle* s = (BridgeShuttle*)argp;
@@ -556,7 +573,7 @@ static unsigned __stdcall bridgeShuttle(void* argp) {
     if (s->pipeToSock) {
         for (;;) {
             DWORD n = 0;
-            if (!ReadFile(s->pipe, buf, sizeof(buf), &n, nullptr) || n == 0) break;
+            if (!ovlReadPipe(s->pipe, s->ovlEvent, buf, sizeof(buf), &n)) break;
             int off = 0;
             while (off < (int)n) {
                 int w = send(s->sock, buf + off, (int)n - off, 0);
@@ -574,7 +591,7 @@ static unsigned __stdcall bridgeShuttle(void* argp) {
             DWORD off = 0;
             while (off < (DWORD)n) {
                 DWORD w = 0;
-                if (!WriteFile(s->pipe, buf + off, n - off, &w, nullptr)) goto done2;
+                if (!ovlWritePipe(s->pipe, s->ovlEvent, buf + off, n - off, &w)) goto done2;
                 off += w;
             }
         }
@@ -582,6 +599,7 @@ static unsigned __stdcall bridgeShuttle(void* argp) {
         CloseHandle(s->pipe);
         shutdown(s->sock, SD_RECEIVE);
     }
+    CloseHandle(s->ovlEvent);
     delete s;
     return 0;
 }
@@ -617,8 +635,13 @@ static unsigned __stdcall bridgePipeConn(void* argp) {
     DuplicateHandle(GetCurrentProcess(), pipe, GetCurrentProcess(), &pipe2,
                     0, FALSE, DUPLICATE_SAME_ACCESS);
 
-    auto* s1 = new BridgeShuttle{sock, pipe,  true};   // pipe → sock
-    auto* s2 = new BridgeShuttle{sock, pipe2, false};  // sock → pipe
+    // Each shuttle gets its own manual-reset event for OVERLAPPED I/O.
+    // Concurrent ops on the same pipe instance now work — the kernel
+    // distinguishes them by the OVERLAPPED struct, not by handle.
+    HANDLE ev1 = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE ev2 = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    auto* s1 = new BridgeShuttle{sock, pipe,  true,  ev1};  // pipe → sock
+    auto* s2 = new BridgeShuttle{sock, pipe2, false, ev2};  // sock → pipe
     HANDLE t1 = (HANDLE)_beginthreadex(nullptr, 0, bridgeShuttle, s1, 0, nullptr);
     HANDLE t2 = (HANDLE)_beginthreadex(nullptr, 0, bridgeShuttle, s2, 0, nullptr);
     HANDLE ts[2] = {t1, t2};
@@ -645,7 +668,7 @@ static unsigned __stdcall bridgeListener(void* argp) {
     while (!*la->stop) {
         HANDLE pipe = CreateNamedPipeW(
             la->pipeName.c_str(),
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
                 PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
@@ -658,12 +681,28 @@ static unsigned __stdcall bridgeListener(void* argp) {
             return 1;
         }
 
-        // ConnectNamedPipe blocks until a client connects. On stop, the
-        // main thread sets *stop and this thread is abandoned — it will
-        // either be waiting here (and die with the process) or mid-forward
-        // (and finish that connection). Both are fine.
-        BOOL ok = ConnectNamedPipe(pipe, nullptr);
-        if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
+        // OVERLAPPED ConnectNamedPipe — the pipe is FILE_FLAG_OVERLAPPED
+        // so the shuttle threads can ReadFile and WriteFile concurrently
+        // (synchronous pipe instances serialize ALL I/O, even across
+        // duplicated handles — ERROR_NO_DATA on WriteFile while a
+        // ReadFile is pending). On stop, the main thread sets *stop and
+        // this thread is abandoned; it either dies waiting here or
+        // finishes the in-flight forward.
+        OVERLAPPED connOvl = {};
+        connOvl.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = ConnectNamedPipe(pipe, &connOvl);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                WaitForSingleObject(connOvl.hEvent, INFINITE);
+                DWORD _unused;
+                ok = GetOverlappedResult(pipe, &connOvl, &_unused, FALSE);
+            } else if (err == ERROR_PIPE_CONNECTED) {
+                ok = TRUE;
+            }
+        }
+        CloseHandle(connOvl.hEvent);
+        if (!ok) {
             CloseHandle(pipe);
             continue;
         }

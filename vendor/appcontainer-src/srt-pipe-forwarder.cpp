@@ -32,7 +32,24 @@ struct Shuttle {
     SOCKET sock;
     HANDLE pipe;       // duplicate handle; each shuttle owns its copy
     bool sockToPipe;
+    HANDLE ovlEvent;   // per-shuttle event for OVERLAPPED pipe I/O
 };
+
+// Synchronous-style wrappers over OVERLAPPED pipe I/O. The pipe is
+// FILE_FLAG_OVERLAPPED so concurrent ReadFile + WriteFile can be in
+// flight on the same instance (one per shuttle event).
+static bool ovlReadPipe(HANDLE pipe, HANDLE ev, char* buf, DWORD cap, DWORD* n) {
+    OVERLAPPED ovl = {}; ovl.hEvent = ev;
+    BOOL ok = ReadFile(pipe, buf, cap, nullptr, &ovl);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) return false;
+    return GetOverlappedResult(pipe, &ovl, n, TRUE) && *n > 0;
+}
+static bool ovlWritePipe(HANDLE pipe, HANDLE ev, const char* buf, DWORD len, DWORD* w) {
+    OVERLAPPED ovl = {}; ovl.hEvent = ev;
+    BOOL ok = WriteFile(pipe, buf, len, nullptr, &ovl);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) return false;
+    return GetOverlappedResult(pipe, &ovl, w, TRUE);
+}
 
 // One-way copy. On EOF/error, closes its own pipe handle (dup) and shuts
 // down the socket in its direction so the sibling's blocking call returns.
@@ -47,7 +64,7 @@ static unsigned __stdcall shuttle(void* argp) {
             DWORD off = 0;
             while (off < (DWORD)n) {
                 DWORD w = 0;
-                if (!WriteFile(s->pipe, buf + off, n - off, &w, nullptr))
+                if (!ovlWritePipe(s->pipe, s->ovlEvent, buf + off, n - off, &w))
                     goto done_s2p;
                 off += w;
             }
@@ -62,7 +79,7 @@ static unsigned __stdcall shuttle(void* argp) {
     } else {
         for (;;) {
             DWORD n = 0;
-            if (!ReadFile(s->pipe, buf, sizeof(buf), &n, nullptr) || n == 0)
+            if (!ovlReadPipe(s->pipe, s->ovlEvent, buf, sizeof(buf), &n))
                 break;
             int off = 0;
             while (off < (int)n) {
@@ -76,6 +93,7 @@ static unsigned __stdcall shuttle(void* argp) {
         shutdown(s->sock, SD_SEND);
     }
 
+    CloseHandle(s->ovlEvent);
     delete s;
     return 0;
 }
@@ -94,7 +112,8 @@ static unsigned __stdcall handleConn(void* argp) {
     HANDLE pipe = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 50; attempt++) {
         pipe = CreateFileW(pipeName, GENERIC_READ | GENERIC_WRITE, 0,
-                           nullptr, OPEN_EXISTING, 0, nullptr);
+                           nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
+                           nullptr);
         if (pipe != INVALID_HANDLE_VALUE) break;
         if (GetLastError() != ERROR_PIPE_BUSY) break;
         WaitNamedPipeW(pipeName, 2000);
@@ -114,8 +133,10 @@ static unsigned __stdcall handleConn(void* argp) {
         return 1;
     }
 
-    auto* s1 = new Shuttle{sock, pipe,  true};   // sock → pipe
-    auto* s2 = new Shuttle{sock, pipe2, false};  // pipe → sock
+    HANDLE ev1 = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE ev2 = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    auto* s1 = new Shuttle{sock, pipe,  true,  ev1};  // sock → pipe
+    auto* s2 = new Shuttle{sock, pipe2, false, ev2};  // pipe → sock
 
     HANDLE t1 = (HANDLE)_beginthreadex(nullptr, 0, shuttle, s1, 0, nullptr);
     HANDLE t2 = (HANDLE)_beginthreadex(nullptr, 0, shuttle, s2, 0, nullptr);
