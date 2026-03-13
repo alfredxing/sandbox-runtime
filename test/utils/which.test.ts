@@ -10,8 +10,11 @@ import { whichSync } from '../../src/utils/which.js'
  *
  * The Node.js fallback is tested separately in which-node-test.mjs
  */
+const isWindows = process.platform === 'win32'
+
 describe('whichSync', () => {
   it('should find existing executables', () => {
+    if (isWindows) return // ls is POSIX-only
     // 'ls' should exist on all Unix systems
     const result = whichSync('ls')
     expect(result).not.toBeNull()
@@ -24,6 +27,7 @@ describe('whichSync', () => {
   })
 
   it('should find common tools', () => {
+    if (isWindows) return // bash/cat are POSIX-only
     // These should exist in most environments
     const bash = whichSync('bash')
     expect(bash).not.toBeNull()

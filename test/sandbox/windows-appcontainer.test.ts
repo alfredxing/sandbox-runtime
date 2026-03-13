@@ -268,9 +268,13 @@ describe('windows-appcontainer: integration', () => {
 
   describe('network', () => {
     it('blocks direct TCP connect without internetClient', async () => {
-      // Use PowerShell (system dir, accessible from AppContainer) instead
-      // of node (user-profile dir, not readable from AppContainer).
-      const cmd = `powershell -NoProfile -Command "try { $c = [System.Net.Sockets.TcpClient]::new(); $c.Connect('1.1.1.1', 443); exit 0 } catch { Write-Error $_.Exception.Message; exit 1 }"`
+      // curl ships in System32 on Win10 1803+. PATH-resolved, not absolute —
+      // LowBox tokens strip SeChangeNotifyPrivilege, so cmd.exe's unquoted-
+      // absolute-path probe (GetFileAttributesW) dies at C:\ traversal
+      // (drive root has no ALL APPLICATION PACKAGES ACE). PATH resolution
+      // skips the probe and CreateProcess succeeds. PowerShell fails even
+      // with all that solved — its init touches inaccessible profile dirs.
+      const cmd = `curl --connect-timeout 3 -sS http://1.1.1.1/`
 
       const wrapped = await wrapCommandWithSandboxWindows({
         command: cmd,
@@ -280,20 +284,19 @@ describe('windows-appcontainer: integration', () => {
       })
 
       const { code, stderr } = runWrapped(wrapped)
-      // Either the loopback exemption failed (helper exits 126), or the
-      // child's connect was refused (exit 1 with WSAEACCES/ECONNREFUSED).
-      // Either way: NOT exit 0 (connect succeeded).
+      // curl without internetClient: connect() → WSAEACCES → exit 7.
+      // The exit code is the invariant; stderr phrasing varies by curl build.
       expect(code).not.toBe(0)
-      if (code === 1) {
-        expect(stderr).toMatch(
-          /Access is denied|EACCES|ECONNREFUSED|EPERM|ActivelyRefused/,
-        )
-      }
+      expect(stderr.toLowerCase()).toContain('connect')
     })
 
-    it('allows loopback to a local listener', async () => {
-      // Start a dummy TCP listener on the host, verify the sandboxed child
-      // can connect to it. This validates the loopback exemption.
+    // AC→host loopback is blocked by AppContainer network isolation.
+    // The named-pipe bridge (srt-appcontainer.cpp:489) tunnels proxy
+    // traffic through pipes (filesystem DACLs, not subject to network
+    // isolation); its intra-AC loopback invariant is proven by
+    // spike-intraloop.exe. NetworkIsolationSetAppContainerConfig would
+    // bypass this but requires admin — the bridge is the non-admin path.
+    it('blocks loopback to a host-side listener (no bridge, no exemption)', async () => {
       const server = net.createServer(sock => {
         sock.write('pong')
         sock.end()
@@ -302,9 +305,7 @@ describe('windows-appcontainer: integration', () => {
       const port = (server.address() as net.AddressInfo).port
 
       try {
-        // Use PowerShell (system dir, accessible from AppContainer) instead
-        // of node (user-profile dir, not readable from AppContainer).
-        const cmd = `powershell -NoProfile -Command "$c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', ${port}); $s = $c.GetStream(); $r = [System.IO.StreamReader]::new($s); $d = $r.ReadToEnd(); Write-Output $d; $c.Close()"`
+        const cmd = `curl --connect-timeout 2 -sS http://127.0.0.1:${port}/`
 
         const wrapped = await wrapCommandWithSandboxWindows({
           command: cmd,
@@ -313,24 +314,18 @@ describe('windows-appcontainer: integration', () => {
           writeConfig: { allowOnly: [testDir], denyWithinAllow: [] },
         })
 
-        const { code, stdout, stderr } = runWrapped(wrapped)
-        // If loopback exemption requires admin and wasn't granted, the
-        // helper exits 126 before spawning. That's expected on non-admin
-        // CI — note it but don't fail the test suite.
-        if (code === 126) {
-          console.warn(
-            'Loopback exemption requires admin on this machine; skipping assertion. ' +
-              'stderr: ' +
-              stderr,
-          )
-          return
-        }
-        expect(code).toBe(0)
-        expect(stdout.trim()).toBe('pong')
+        const { code } = runWrapped(wrapped)
+        // No proxy ports → no pipe bridge → no exemption → blocked.
+        // curl exit 28 (timeout) or 7 (couldn't connect).
+        expect(code).not.toBe(0)
       } finally {
         server.close()
       }
     })
+
+    // TODO: end-to-end test of the pipe bridge. Set httpProxyPort to a
+    // host-side listener, verify curl with HTTP_PROXY reaches it through
+    // the bridge. Requires the forwarder binary to be built.
   })
 
   describe('ACL lifecycle', () => {

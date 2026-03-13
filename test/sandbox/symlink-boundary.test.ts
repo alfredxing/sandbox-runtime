@@ -368,6 +368,14 @@ describe('isSymlinkOutsideBoundary Unit Tests', () => {
   })
 
   describe('Valid Resolutions', () => {
+    // isSymlinkOutsideBoundary uses path.normalize + split('/') — on Windows
+    // path.normalize('/tmp/x') → '\tmp\x' which breaks the string checks.
+    // The function is POSIX-only (not called from the Windows backend).
+    if (getPlatform() === 'windows') {
+      it.skip('POSIX path logic — not called on Windows', () => {})
+      return
+    }
+
     it('should allow resolution to same path', () => {
       expect(isSymlinkOutsideBoundary('/tmp/claude', '/tmp/claude')).toBe(false)
       expect(isSymlinkOutsideBoundary('/home/user', '/home/user')).toBe(false)

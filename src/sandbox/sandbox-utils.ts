@@ -465,12 +465,13 @@ export function globToRegex(globPattern: string): string {
       // Escape unclosed brackets (no matching ])
       .replace(/\[([^\]]*?)$/g, '\\[$1')
       // Convert glob patterns to regex (order matters - ** before *)
-      .replace(/\*\*\//g, '__GLOBSTAR_SLASH__') // Placeholder for **/
+      // **/ (or **\ on Windows — already escaped to **\\ by the line above)
+      .replace(/\*\*(\/|\\\\)/g, '__GLOBSTAR_SEP__')
       .replace(/\*\*/g, '__GLOBSTAR__') // Placeholder for **
-      .replace(/\*/g, '[^/]*') // * matches anything except /
-      .replace(/\?/g, '[^/]') // ? matches single character except /
+      .replace(/\*/g, '[^/\\\\]*') // * matches anything except path separator
+      .replace(/\?/g, '[^/\\\\]') // ? matches single char except path separator
       // Restore placeholders
-      .replace(/__GLOBSTAR_SLASH__/g, '(.*/)?') // **/ matches zero or more dirs
+      .replace(/__GLOBSTAR_SEP__/g, '(.*[/\\\\])?') // **/ matches zero or more dirs
       .replace(/__GLOBSTAR__/g, '.*') + // ** matches anything including /
     '$'
   )

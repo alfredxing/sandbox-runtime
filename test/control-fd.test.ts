@@ -9,6 +9,14 @@ import { type Writable } from 'stream'
 const CLI_PATH = path.join(process.cwd(), 'dist', 'cli.js')
 
 describe('--control-fd', () => {
+  // Tests write .sh bash scripts, chmod 0o755, and pass fd 3 via stdio[3].
+  // Windows fd inheritance for stdio[3] uses HANDLE duplication which the
+  // CLI doesn't wire up yet.
+  if (process.platform === 'win32') {
+    it.skip('POSIX fd passing — not yet implemented on Windows', () => {})
+    return
+  }
+
   let tmpDir: string
   let child: ChildProcess | null = null
 

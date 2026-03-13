@@ -809,7 +809,8 @@ static std::wstring buildEnvBlock(const std::vector<std::wstring>& overrides) {
 // is false). envOverrides are merged on top of the inherited environment.
 static HANDLE spawnInContainerRaw(PSID sid, const std::wstring& cmdline,
                                   const std::vector<std::wstring>& envOverrides,
-                                  bool grantInternet) {
+                                  bool grantInternet,
+                                  const wchar_t* cwd) {
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
     auto attrList =
@@ -857,7 +858,7 @@ static HANDLE spawnInContainerRaw(PSID sid, const std::wstring& cmdline,
         nullptr, &mutableCmd[0], nullptr, nullptr,
         TRUE,  // inherit handles for stdio
         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-        (LPVOID)envBlock.c_str(), nullptr, &siex.StartupInfo, &pi);
+        (LPVOID)envBlock.c_str(), cwd, &siex.StartupInfo, &pi);
 
     DWORD err = GetLastError();
     DeleteProcThreadAttributeList(attrList);
@@ -894,12 +895,22 @@ static HANDLE spawnForwarder(PSID sid, const Config& cfg, const PipeBridge& br) 
 
     // Forwarder gets no env overrides (it doesn't care about HTTP_PROXY) and
     // no internetClient (same network restriction as the user command).
-    return spawnInContainerRaw(sid, cmd, {}, false);
+    return spawnInContainerRaw(sid, cmd, {}, false, nullptr);
 }
 
 static DWORD spawnUserCommand(PSID sid, const Config& cfg) {
+    // lpCurrentDirectory: use allowWrite[0]. Inheriting the caller's cwd
+    // fails when the caller is in a directory the container SID can't
+    // read (LowBox tokens strip SeChangeNotifyPrivilege, so even
+    // traversal through C:\ requires an explicit ALL APPLICATION
+    // PACKAGES ACE, which the drive root lacks). cmd.exe then emits
+    // "The current directory is invalid" and exits before the command
+    // runs. allowWrite[0] is granted to the container SID by step 2,
+    // so it's always accessible.
+    const wchar_t* cwd =
+        cfg.allowWrite.empty() ? nullptr : cfg.allowWrite.front().c_str();
     HANDLE proc = spawnInContainerRaw(sid, cfg.command, cfg.env,
-                                      !cfg.needsNetworkRestriction);
+                                      !cfg.needsNetworkRestriction, cwd);
     if (!proc) return 127;
 
     WaitForSingleObject(proc, INFINITE);

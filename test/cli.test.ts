@@ -31,6 +31,8 @@ function runCli(args: string[], options?: { input?: string; debug?: boolean }) {
   }
 }
 
+const isWindows = process.platform === 'win32'
+
 describe('CLI', () => {
   describe('-c flag (command string mode)', () => {
     test('executes simple command with -c flag', () => {
@@ -40,12 +42,14 @@ describe('CLI', () => {
     })
 
     test('passes command string directly without escaping', () => {
+      if (isWindows) return // cmd.exe shell semantics differ (quoting, $VAR, echo -n, wc)
       const result = runCli(['-c', 'echo "hello world"'])
       expect(result.stdout.trim()).toBe('hello world')
       expect(result.status).toBe(0)
     })
 
     test('handles JSON arguments correctly', () => {
+      if (isWindows) return // cmd.exe shell semantics differ (quoting, $VAR, echo -n, wc)
       // This is the main use case - JSON with quotes and special chars
       const result = runCli(['-c', 'echo \'{"key": "value"}\''])
       expect(result.stdout.trim()).toBe('{"key": "value"}')
@@ -53,6 +57,7 @@ describe('CLI', () => {
     })
 
     test('handles complex JSON with nested objects', () => {
+      if (isWindows) return // cmd.exe shell semantics differ (quoting, $VAR, echo -n, wc)
       const json = '{"servers":{"name":"test","type":"sdk"}}'
       const result = runCli(['-c', `echo '${json}'`])
       expect(result.stdout.trim()).toBe(json)
@@ -60,6 +65,7 @@ describe('CLI', () => {
     })
 
     test('handles shell expansion in -c mode', () => {
+      if (isWindows) return // cmd.exe shell semantics differ (quoting, $VAR, echo -n, wc)
       const result = runCli(['-c', 'echo $HOME'])
       // $HOME should be expanded by the shell
       expect(result.stdout.trim()).not.toBe('$HOME')
@@ -67,6 +73,7 @@ describe('CLI', () => {
     })
 
     test('handles pipes in -c mode', () => {
+      if (isWindows) return // cmd.exe shell semantics differ (quoting, $VAR, echo -n, wc)
       const result = runCli(['-c', 'echo "hello world" | wc -w'])
       expect(result.stdout.trim()).toBe('2')
       expect(result.status).toBe(0)
@@ -93,6 +100,7 @@ describe('CLI', () => {
     })
 
     test('handles arguments with flags', () => {
+      if (isWindows) return // cmd.exe shell semantics differ (quoting, $VAR, echo -n, wc)
       const result = runCli(['echo', '-n', 'no newline'])
       // -n flag to echo suppresses newline
       expect(result.stdout).toBe('no newline')
