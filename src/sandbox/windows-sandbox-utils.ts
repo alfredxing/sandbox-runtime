@@ -167,7 +167,8 @@ function cmdQuote(p: string): string {
 }
 
 /**
- * Resolve directories that need an RX grant for the user's binary to launch.
+ * Resolve directories that need an RX grant for the user's binary to launch,
+ * and optionally rewrite the command to quote the binary path.
  *
  * The AppContainer SID has no read/execute on user-profile dirs (scoop, nvm,
  * npm-global — no ALL APPLICATION PACKAGES ACE). The helper grants RX so
@@ -178,21 +179,36 @@ function cmdQuote(p: string): string {
  * loader follows the junction and then needs RX on the TARGET. ACLs on a
  * junction don't propagate — both dirs need the grant.
  *
+ * `quotedCommand` is set when the first token is an unquoted absolute path.
+ * cmd.exe's internal probe for unquoted absolutes (ambiguous-parse: where
+ * does the program name end?) fails ACCESS_DENIED inside the AppContainer —
+ * a cmd.exe quirk, not CreateProcess (direct CreateProcess handles both
+ * forms). Quoting skips the probe.
+ *
  * `command` is the raw user string (before cmd.exe wrapping). First
  * whitespace-delimited token, stripping quotes. Compound shell (`a && b`)
  * only resolves `a` — acceptable, the first binary is the entry point.
  */
-function resolveCommandBinaryDirs(command: string): string[] {
+function resolveCommandBinary(command: string): {
+  dirs: string[]
+  quotedCommand: string | null
+} {
   const m = command.match(/^\s*(?:"([^"]+)"|(\S+))/)
-  if (!m) return []
-  const tok = m[1] ?? m[2]
+  if (!m) return { dirs: [], quotedCommand: null }
+  const quoted = m[1]
+  const bare = m[2]
+  const tok = quoted ?? bare
 
-  const resolved =
-    tok.includes('\\') || tok.includes('/') ? tok : whichSync(tok)
-  if (!resolved || !existsSync(resolved)) return []
+  const hasPathSep = tok.includes('\\') || tok.includes('/')
+  const resolved = hasPathSep ? tok : whichSync(tok)
+  if (!resolved || !existsSync(resolved)) {
+    return { dirs: [], quotedCommand: null }
+  }
 
   // System32 already has ALL APPLICATION PACKAGES — skip to avoid ACL churn.
-  if (resolved.toLowerCase().includes('\\windows\\system32\\')) return []
+  if (resolved.toLowerCase().includes('\\windows\\system32\\')) {
+    return { dirs: [], quotedCommand: null }
+  }
 
   const dirs = [dirname(resolved)]
   try {
@@ -202,7 +218,17 @@ function resolveCommandBinaryDirs(command: string): string[] {
   } catch {
     // realpath failed — still grant the as-found dir
   }
-  return dirs
+
+  // Unquoted absolute → quote it. Only bare tokens with a path separator;
+  // PATH-resolved names ('node') don't trigger cmd.exe's probe.
+  let quotedCommand = null
+  if (bare && hasPathSep) {
+    const rest = command.slice((m.index ?? 0) + m[0].length)
+    const lead = command.slice(0, (m.index ?? 0) + m[0].length - bare.length)
+    quotedCommand = `${lead}"${bare}"${rest}`
+  }
+
+  return { dirs, quotedCommand }
 }
 
 export async function wrapCommandWithSandboxWindows(
@@ -321,13 +347,20 @@ export async function wrapCommandWithSandboxWindows(
   //     quotes and preserves everything inside, which is exactly what we
   //     want for a command that may itself contain quotes.
   // /c: run and exit
-  const grantExecuteDirs = resolveCommandBinaryDirs(command)
+  const { dirs: grantExecuteDirs, quotedCommand } =
+    resolveCommandBinary(command)
   for (const d of grantExecuteDirs) {
     logForDebugging(`Windows AppContainer: granting RX on ${d}`)
   }
+  const effectiveCommand = quotedCommand ?? command
+  if (quotedCommand) {
+    logForDebugging(
+      `Windows AppContainer: quoting absolute path: ${quotedCommand}`,
+    )
+  }
 
   const comspec = process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe'
-  const childCmd = `${cmdQuote(comspec)} /d /s /c "${command}"`
+  const childCmd = `${cmdQuote(comspec)} /d /s /c "${effectiveCommand}"`
 
   // --- write config + return ------------------------------------------------
   const forwarderPath = bridgeActive ? getPipeForwarderPath() : null
