@@ -21,11 +21,20 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent $ScriptDir
-$SourceFile = Join-Path $RootDir "vendor\appcontainer-src\srt-appcontainer.cpp"
+$SourceDir = Join-Path $RootDir "vendor\appcontainer-src"
 
-if (-not (Test-Path $SourceFile)) {
-    Write-Error "Source not found: $SourceFile"
-    exit 1
+# Binaries to build: (basename, link-libs). All sources are $SourceDir\<basename>.cpp.
+$Binaries = @(
+    @{ Name = "srt-appcontainer";  Libs = @("userenv.lib", "advapi32.lib", "shell32.lib", "ws2_32.lib") },
+    @{ Name = "srt-pipe-forwarder"; Libs = @("ws2_32.lib") }
+)
+
+foreach ($bin in $Binaries) {
+    $src = Join-Path $SourceDir "$($bin.Name).cpp"
+    if (-not (Test-Path $src)) {
+        Write-Error "Source not found: $src"
+        exit 1
+    }
 }
 
 function Find-VcVarsAll {
@@ -52,16 +61,16 @@ function Find-VcVarsAll {
     return $null
 }
 
-function Build-Arch {
-    param([string]$TargetArch)
+function Build-One {
+    param([string]$TargetArch, [string]$BinName, [string[]]$LinkLibs)
 
     $OutputDir = Join-Path $RootDir "vendor\appcontainer\$TargetArch"
-    $OutputExe = Join-Path $OutputDir "srt-appcontainer.exe"
+    $OutputExe = Join-Path $OutputDir "$BinName.exe"
+    $SourceFile = Join-Path $SourceDir "$BinName.cpp"
 
     if ((Test-Path $OutputExe) -and -not $Force) {
         $size = (Get-Item $OutputExe).Length
-        Write-Host "[skip] $TargetArch binary already exists ($size bytes): $OutputExe"
-        Write-Host "       (use -Force to rebuild)"
+        Write-Host "[skip] $TargetArch $BinName already exists ($size bytes)"
         return
     }
 
@@ -69,28 +78,20 @@ function Build-Arch {
 
     Write-Host ""
     Write-Host "=========================================="
-    Write-Host "Building srt-appcontainer.exe for $TargetArch"
+    Write-Host "Building $BinName.exe for $TargetArch"
     Write-Host "=========================================="
 
-    # If cl.exe is already on PATH and matches the target arch, use it directly.
-    # Otherwise, shell through vcvarsall.bat.
     $clAvailable = Get-Command cl.exe -ErrorAction SilentlyContinue
 
     $clFlags = @(
-        "/nologo",
-        "/O2",               # optimize
-        "/MT",               # static CRT — no vcruntime140.dll dep
-        "/EHsc",             # C++ exceptions
-        "/W4",               # warnings
+        "/nologo", "/O2", "/MT", "/EHsc", "/W4",
         "/DUNICODE", "/D_UNICODE",
         "/Fe:$OutputExe",
         $SourceFile,
-        "/link",
-        "userenv.lib", "advapi32.lib", "shell32.lib"
-    )
+        "/link"
+    ) + $LinkLibs
 
     if ($clAvailable -and $TargetArch -eq "x64") {
-        # Direct invocation — caller already set up the environment.
         Write-Host "Using cl.exe from PATH"
         & cl.exe @clFlags
         if ($LASTEXITCODE -ne 0) {
@@ -98,20 +99,15 @@ function Build-Arch {
             exit 1
         }
     } else {
-        # Shell through vcvarsall for cross-compilation / env setup.
         $vcvars = Find-VcVarsAll
         if (-not $vcvars) {
             Write-Error "vcvarsall.bat not found. Install Visual Studio Build Tools with the C++ workload."
             exit 1
         }
         Write-Host "Using vcvarsall: $vcvars"
-
-        # vcvarsall arch strings: x64 → x64, arm64 → x64_arm64 (cross)
         $vcArch = if ($TargetArch -eq "arm64") { "x64_arm64" } else { "x64" }
-
         $clCmd = "cl.exe " + ($clFlags -join " ")
-        $cmd = "`"$vcvars`" $vcArch && $clCmd"
-        & cmd.exe /c $cmd
+        & cmd.exe /c "`"$vcvars`" $vcArch && $clCmd"
         if ($LASTEXITCODE -ne 0) {
             Write-Error "build failed with code $LASTEXITCODE"
             exit 1
@@ -123,11 +119,17 @@ function Build-Arch {
         exit 1
     }
 
-    # Clean up .obj left in cwd by cl.
-    Remove-Item -Path "srt-appcontainer.obj" -ErrorAction SilentlyContinue
+    Remove-Item -Path "$BinName.obj" -ErrorAction SilentlyContinue
 
     $size = (Get-Item $OutputExe).Length
     Write-Host "[ok] $OutputExe ($size bytes)"
+}
+
+function Build-Arch {
+    param([string]$TargetArch)
+    foreach ($bin in $Binaries) {
+        Build-One -TargetArch $TargetArch -BinName $bin.Name -LinkLibs $bin.Libs
+    }
 }
 
 $archList = if ($Arch -eq "both") { @("x64", "arm64") } else { @($Arch) }

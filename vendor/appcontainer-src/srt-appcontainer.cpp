@@ -13,17 +13,23 @@
 //
 // Build (MSVC):
 //   cl /O2 /MT /EHsc /W4 /DUNICODE /D_UNICODE srt-appcontainer.cpp ^
-//      /link userenv.lib advapi32.lib shell32.lib
+//      /link userenv.lib advapi32.lib shell32.lib ws2_32.lib
 //
 //   /MT links the static CRT so the binary has no vcruntime140.dll dependency.
 //
 // Security model:
 //   - AppContainer with zero capabilities: child cannot open outbound TCP to
-//     non-loopback addresses. Loopback is blocked by default too (network
-//     isolation); we explicitly exempt our SID via NetworkIsolationSetAppContainerConfig
-//     so the child can reach the srt proxy on 127.0.0.1.
+//     non-loopback addresses. Loopback to other processes is also blocked by
+//     AppContainer network isolation — but intra-container loopback works
+//     (two processes with the same AppContainer SID can talk to each other).
+//   - Network bridge: a named pipe crosses the AppContainer boundary. The
+//     helper listens on \\.\pipe\srt-<id>-{http,socks} (pipe DACL grants the
+//     AppContainer SID) and forwards to the srt proxy on 127.0.0.1. An
+//     in-container forwarder listens on 127.0.0.1:{3128,1080} and forwards
+//     to the pipe. The user command sees HTTP_PROXY=http://127.0.0.1:3128.
 //   - Filesystem write is deny-by-default. allowWrite paths get an explicit
-//     GRANT ACE for the AppContainer SID. denyRead paths get a DENY ACE.
+//     GRANT ACE for the AppContainer SID. denyRead paths have the SID's
+//     inherited ALLOW stripped and DACL protected from re-inheritance.
 //   - The child cannot mutate ACLs (no WRITE_DAC) so it cannot escape.
 //   - All ACL changes are recorded in a sidecar file before spawning so that
 //     a crash recovery sweep can undo them.
@@ -34,6 +40,9 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <shellapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <process.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -79,6 +88,11 @@ struct Config {
     std::vector<std::wstring> denyRead;
     std::vector<std::wstring> env;  // "KEY=value" pairs to override/add
     bool needsNetworkRestriction = true;
+    // Pipe bridge: host-side proxy ports to forward pipe traffic to, and
+    // path to the in-container forwarder binary. Zero port = not used.
+    int httpProxyPort = 0;
+    int socksProxyPort = 0;
+    std::wstring forwarderPath;
 };
 
 struct JsonReader {
@@ -194,6 +208,18 @@ struct JsonReader {
         return out;
     }
 
+    int readInt() {
+        skipWs();
+        int sign = 1;
+        if (p < end && *p == '-') { sign = -1; p++; }
+        int v = 0;
+        while (p < end && *p >= '0' && *p <= '9') {
+            v = v * 10 + (*p - '0');
+            p++;
+        }
+        return v * sign;
+    }
+
     bool readBool() {
         skipWs();
         if (p + 4 <= end && strncmp(p, "true", 4) == 0) {
@@ -218,6 +244,7 @@ struct JsonReader {
         if (*p == '[') { readStringArray(); return; }
         if (*p == 't' || *p == 'f') { readBool(); return; }
         if (p + 4 <= end && strncmp(p, "null", 4) == 0) { p += 4; return; }
+        if ((*p >= '0' && *p <= '9') || *p == '-') { readInt(); return; }
         // Unknown token — advance to next delimiter.
         while (p < end && *p != ',' && *p != '}') p++;
     }
@@ -254,6 +281,9 @@ static Config parseConfigFile(const wchar_t* path) {
         else if (key == L"denyRead")               cfg.denyRead    = r.readStringArray();
         else if (key == L"env")                    cfg.env         = r.readStringArray();
         else if (key == L"needsNetworkRestriction") cfg.needsNetworkRestriction = r.readBool();
+        else if (key == L"httpProxyPort")          cfg.httpProxyPort  = r.readInt();
+        else if (key == L"socksProxyPort")         cfg.socksProxyPort = r.readInt();
+        else if (key == L"forwarderPath")          cfg.forwarderPath  = r.readString();
         else r.skipValue();
     }
     return cfg;
@@ -454,125 +484,252 @@ static void removeAcesForSid(const std::wstring& path, PSID sid) {
 }
 
 // ---------------------------------------------------------------------------
-// Loopback exemption
+// Named-pipe bridge
 //
-// AppContainers are network-isolated by default: they cannot connect to
-// 127.0.0.1 because that would let a compromised sandbox attack local
-// services. We specifically WANT the child to reach srt's allowlist proxy on
-// 127.0.0.1, so we exempt our per-invocation SID.
+// AppContainer network isolation blocks loopback to processes outside the
+// container, and the admin-only NetworkIsolationSetAppContainerConfig
+// exemption is not usable here. Instead we bridge over a named pipe: pipe
+// DACLs are filesystem-object security, not subject to network isolation.
 //
-// NetworkIsolationSetAppContainerConfig is in Firewallapi.dll (Win8+) but is
-// not always present in the import libs shipped with older SDKs, so we load
-// it dynamically.
-//
-// On some Windows versions this call requires admin. If it fails with
-// ERROR_ACCESS_DENIED, we print instructions for a one-time manual exemption
-// and fail closed — network restriction was requested, we can't deliver it
-// safely without the proxy being reachable.
+// The helper (full integrity) creates \\.\pipe\srt-<id>-{http,socks} with a
+// DACL granting the AppContainer SID, and runs threads that accept pipe
+// connections and forward each to 127.0.0.1:<proxyPort>. The in-container
+// forwarder connects to these pipes and exposes TCP listeners on
+// 127.0.0.1:{3128,1080} that the user command uses via HTTP_PROXY/ALL_PROXY.
 // ---------------------------------------------------------------------------
 
-typedef struct _INET_FIREWALL_AC_BINARY {
-    DWORD size;
-    BYTE* data;
-} INET_FIREWALL_AC_BINARY;
+// Build a security descriptor granting the AppContainer SID full access to
+// the pipe. System/current-user get access implicitly (as pipe creator).
+static bool buildPipeSA(PSID containerSid, SECURITY_ATTRIBUTES* sa,
+                        PSECURITY_DESCRIPTOR* outSd, PACL* outDacl) {
+    // Also grant the current user so the helper's own CreateNamedPipe works
+    // (creator owns the pipe, but an explicit ACE avoids edge cases).
+    HANDLE token = nullptr;
+    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token);
+    DWORD userLen = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &userLen);
+    auto userBuf = (PTOKEN_USER)LocalAlloc(LPTR, userLen);
+    GetTokenInformation(token, TokenUser, userBuf, userLen, &userLen);
+    CloseHandle(token);
 
-typedef struct _INET_FIREWALL_APP_CONTAINER {
-    SID* appContainerSid;
-    SID* userSid;
-    LPWSTR appContainerName;
-    LPWSTR displayName;
-    LPWSTR description;
-    INET_FIREWALL_AC_BINARY capabilities;
-    INET_FIREWALL_AC_BINARY binaries;
-    LPWSTR workingDirectory;
-    LPWSTR packageFullName;
-} INET_FIREWALL_APP_CONTAINER;
+    EXPLICIT_ACCESS_W ea[2] = {};
+    ea[0].grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+    ea[0].grfAccessMode = GRANT_ACCESS;
+    ea[0].grfInheritance = NO_INHERITANCE;
+    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[0].Trustee.ptstrName = (LPWSTR)containerSid;
 
-typedef DWORD(WINAPI* PFN_NetIsoSetConfig)(DWORD, PSID_AND_ATTRIBUTES);
-typedef DWORD(WINAPI* PFN_NetIsoGetConfig)(DWORD*, PSID_AND_ATTRIBUTES*);
-typedef DWORD(WINAPI* PFN_NetIsoFree)(PSID_AND_ATTRIBUTES);
+    ea[1] = ea[0];
+    ea[1].grfAccessPermissions = GENERIC_ALL;
+    ea[1].Trustee.ptstrName = (LPWSTR)userBuf->User.Sid;
 
-static bool enableLoopback(PSID sid) {
-    HMODULE fw = LoadLibraryW(L"Firewallapi.dll");
-    if (!fw) {
-        warn(L"Firewallapi.dll not found; loopback to proxy may fail");
+    PACL dacl = nullptr;
+    if (SetEntriesInAclW(2, ea, nullptr, &dacl) != ERROR_SUCCESS) {
+        LocalFree(userBuf);
         return false;
     }
-    auto getConfig = (PFN_NetIsoGetConfig)GetProcAddress(
-        fw, "NetworkIsolationGetAppContainerConfig");
-    auto setConfig = (PFN_NetIsoSetConfig)GetProcAddress(
-        fw, "NetworkIsolationSetAppContainerConfig");
-    auto freeConfig = (PFN_NetIsoFree)GetProcAddress(
-        fw, "NetworkIsolationFreeAppContainers");
-    if (!getConfig || !setConfig) {
-        warn(L"NetworkIsolation APIs not found; loopback to proxy may fail");
-        FreeLibrary(fw);
-        return false;
+    LocalFree(userBuf);
+
+    PSECURITY_DESCRIPTOR sd = LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
+    InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(sd, TRUE, dacl, FALSE);
+
+    sa->nLength = sizeof(*sa);
+    sa->lpSecurityDescriptor = sd;
+    sa->bInheritHandle = FALSE;
+    *outSd = sd;
+    *outDacl = dacl;
+    return true;
+}
+
+struct BridgeShuttle {
+    SOCKET sock;
+    HANDLE pipe;
+    bool pipeToSock;
+};
+
+static unsigned __stdcall bridgeShuttle(void* argp) {
+    BridgeShuttle* s = (BridgeShuttle*)argp;
+    char buf[16 * 1024];
+    if (s->pipeToSock) {
+        for (;;) {
+            DWORD n = 0;
+            if (!ReadFile(s->pipe, buf, sizeof(buf), &n, nullptr) || n == 0) break;
+            int off = 0;
+            while (off < (int)n) {
+                int w = send(s->sock, buf + off, (int)n - off, 0);
+                if (w <= 0) goto done1;
+                off += w;
+            }
+        }
+    done1:
+        CloseHandle(s->pipe);
+        shutdown(s->sock, SD_SEND);
+    } else {
+        for (;;) {
+            int n = recv(s->sock, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            DWORD off = 0;
+            while (off < (DWORD)n) {
+                DWORD w = 0;
+                if (!WriteFile(s->pipe, buf + off, n - off, &w, nullptr)) goto done2;
+                off += w;
+            }
+        }
+    done2:
+        CloseHandle(s->pipe);
+        shutdown(s->sock, SD_RECEIVE);
+    }
+    delete s;
+    return 0;
+}
+
+struct PipeConnArgs {
+    HANDLE pipe;         // connected pipe instance (helper side)
+    u_short proxyPort;   // 127.0.0.1:<proxyPort> to forward to
+};
+
+// Forward one pipe connection to one TCP connection to the proxy.
+static unsigned __stdcall bridgePipeConn(void* argp) {
+    PipeConnArgs* c = (PipeConnArgs*)argp;
+    HANDLE pipe = c->pipe;
+    u_short port = c->proxyPort;
+    delete c;
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        CloseHandle(pipe);
+        return 1;
+    }
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        closesocket(sock);
+        CloseHandle(pipe);
+        return 1;
     }
 
-    // Read existing exemptions, append ours, write back. The API replaces the
-    // full list, so we must merge.
-    DWORD existingCount = 0;
-    PSID_AND_ATTRIBUTES existing = nullptr;
-    getConfig(&existingCount, &existing);
+    HANDLE pipe2 = INVALID_HANDLE_VALUE;
+    DuplicateHandle(GetCurrentProcess(), pipe, GetCurrentProcess(), &pipe2,
+                    0, FALSE, DUPLICATE_SAME_ACCESS);
 
-    std::vector<SID_AND_ATTRIBUTES> merged;
-    for (DWORD i = 0; i < existingCount; i++) {
-        merged.push_back(existing[i]);
+    auto* s1 = new BridgeShuttle{sock, pipe,  true};   // pipe → sock
+    auto* s2 = new BridgeShuttle{sock, pipe2, false};  // sock → pipe
+    HANDLE t1 = (HANDLE)_beginthreadex(nullptr, 0, bridgeShuttle, s1, 0, nullptr);
+    HANDLE t2 = (HANDLE)_beginthreadex(nullptr, 0, bridgeShuttle, s2, 0, nullptr);
+    HANDLE ts[2] = {t1, t2};
+    WaitForMultipleObjects(2, ts, TRUE, INFINITE);
+    CloseHandle(t1);
+    CloseHandle(t2);
+    closesocket(sock);
+    return 0;
+}
+
+struct BridgeListenerArgs {
+    std::wstring pipeName;
+    u_short proxyPort;
+    SECURITY_ATTRIBUTES* sa;
+    volatile bool* stop;
+};
+
+// Accept-loop: create a pipe instance, wait for a client (the in-AC
+// forwarder), hand it off to bridgePipeConn, repeat. Each iteration creates
+// a fresh instance so multiple concurrent connections work.
+static unsigned __stdcall bridgeListener(void* argp) {
+    BridgeListenerArgs* la = (BridgeListenerArgs*)argp;
+
+    while (!*la->stop) {
+        HANDLE pipe = CreateNamedPipeW(
+            la->pipeName.c_str(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+                PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            64 * 1024, 64 * 1024,
+            0,      // default timeout for WaitNamedPipe
+            la->sa);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            // Most likely: we lost a race with stop during teardown, or the
+            // SA is bad. Either way, nothing useful to do on retry.
+            return 1;
+        }
+
+        // ConnectNamedPipe blocks until a client connects. On stop, the
+        // main thread sets *stop and this thread is abandoned — it will
+        // either be waiting here (and die with the process) or mid-forward
+        // (and finish that connection). Both are fine.
+        BOOL ok = ConnectNamedPipe(pipe, nullptr);
+        if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
+            CloseHandle(pipe);
+            continue;
+        }
+        if (*la->stop) {
+            CloseHandle(pipe);
+            return 0;
+        }
+
+        auto* c = new PipeConnArgs{pipe, la->proxyPort};
+        HANDLE t = (HANDLE)_beginthreadex(nullptr, 0, bridgePipeConn, c, 0, nullptr);
+        if (t) CloseHandle(t);
+        else { CloseHandle(pipe); delete c; }
     }
-    SID_AND_ATTRIBUTES ours = {};
-    ours.Sid = sid;
-    ours.Attributes = 0;
-    merged.push_back(ours);
+    return 0;
+}
 
-    DWORD err = setConfig((DWORD)merged.size(), merged.data());
+struct PipeBridge {
+    std::wstring httpPipeName;
+    std::wstring socksPipeName;
+    SECURITY_ATTRIBUTES sa = {};
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    PACL dacl = nullptr;
+    BridgeListenerArgs httpArgs = {};
+    BridgeListenerArgs socksArgs = {};
+    volatile bool stop = false;
+};
 
-    if (existing && freeConfig) freeConfig(existing);
-    FreeLibrary(fw);
+// Starts pipe-listener threads. Returns false on setup failure. Does NOT
+// wait for a client — listeners run in the background until stop is set.
+static bool startPipeBridge(PipeBridge* br, PSID containerSid,
+                            const std::wstring& profileName,
+                            int httpProxyPort, int socksProxyPort) {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
 
-    if (err != ERROR_SUCCESS) {
-        wchar_t* sidStr = nullptr;
-        ConvertSidToStringSidW(sid, &sidStr);
-        fwprintf(stderr,
-                 L"srt-appcontainer: loopback exemption failed (error %lu).\n"
-                 L"  Network restriction is enabled but the sandboxed process cannot\n"
-                 L"  reach the allowlist proxy. Run once as admin:\n"
-                 L"    CheckNetIsolation LoopbackExempt -a -p=%ls\n"
-                 L"  Or disable network restriction for this run.\n",
-                 err, sidStr ? sidStr : L"<SID>");
-        if (sidStr) LocalFree(sidStr);
-        return false;
+    if (!buildPipeSA(containerSid, &br->sa, &br->sd, &br->dacl)) return false;
+
+    br->httpPipeName  = L"\\\\.\\pipe\\" + profileName + L"-http";
+    br->socksPipeName = L"\\\\.\\pipe\\" + profileName + L"-socks";
+
+    if (httpProxyPort > 0) {
+        br->httpArgs.pipeName  = br->httpPipeName;
+        br->httpArgs.proxyPort = (u_short)httpProxyPort;
+        br->httpArgs.sa        = &br->sa;
+        br->httpArgs.stop      = &br->stop;
+        HANDLE t = (HANDLE)_beginthreadex(nullptr, 0, bridgeListener,
+                                          &br->httpArgs, 0, nullptr);
+        if (t) CloseHandle(t);
+    }
+    if (socksProxyPort > 0) {
+        br->socksArgs.pipeName  = br->socksPipeName;
+        br->socksArgs.proxyPort = (u_short)socksProxyPort;
+        br->socksArgs.sa        = &br->sa;
+        br->socksArgs.stop      = &br->stop;
+        HANDLE t = (HANDLE)_beginthreadex(nullptr, 0, bridgeListener,
+                                          &br->socksArgs, 0, nullptr);
+        if (t) CloseHandle(t);
     }
     return true;
 }
 
-// Remove our SID from the loopback exemption list.
-static void disableLoopback(PSID sid) {
-    HMODULE fw = LoadLibraryW(L"Firewallapi.dll");
-    if (!fw) return;
-    auto getConfig = (PFN_NetIsoGetConfig)GetProcAddress(
-        fw, "NetworkIsolationGetAppContainerConfig");
-    auto setConfig = (PFN_NetIsoSetConfig)GetProcAddress(
-        fw, "NetworkIsolationSetAppContainerConfig");
-    auto freeConfig = (PFN_NetIsoFree)GetProcAddress(
-        fw, "NetworkIsolationFreeAppContainers");
-    if (!getConfig || !setConfig) {
-        FreeLibrary(fw);
-        return;
-    }
-
-    DWORD existingCount = 0;
-    PSID_AND_ATTRIBUTES existing = nullptr;
-    getConfig(&existingCount, &existing);
-
-    std::vector<SID_AND_ATTRIBUTES> kept;
-    for (DWORD i = 0; i < existingCount; i++) {
-        if (!EqualSid(existing[i].Sid, sid)) kept.push_back(existing[i]);
-    }
-    setConfig((DWORD)kept.size(), kept.empty() ? nullptr : kept.data());
-
-    if (existing && freeConfig) freeConfig(existing);
-    FreeLibrary(fw);
+static void stopPipeBridge(PipeBridge* br) {
+    br->stop = true;
+    // Listener threads are either blocked in ConnectNamedPipe (will die
+    // with the process) or mid-forward (will finish). We don't join; the
+    // process is about to exit anyway. Free the SD/DACL we allocated.
+    if (br->sd)   LocalFree(br->sd);
+    if (br->dacl) LocalFree(br->dacl);
 }
 
 // ---------------------------------------------------------------------------
@@ -646,27 +803,29 @@ static std::wstring buildEnvBlock(const std::vector<std::wstring>& overrides) {
 // Spawn inside AppContainer
 // ---------------------------------------------------------------------------
 
-static DWORD spawnInContainer(PSID sid, const Config& cfg) {
-    // Allocate the proc-thread attribute list (one attribute: security caps).
+// Spawn a process inside the AppContainer. Returns the process handle (or
+// NULL on failure); caller waits/closes. If grantInternet is true the
+// internetClient capability is attached (used when needsNetworkRestriction
+// is false). envOverrides are merged on top of the inherited environment.
+static HANDLE spawnInContainerRaw(PSID sid, const std::wstring& cmdline,
+                                  const std::vector<std::wstring>& envOverrides,
+                                  bool grantInternet) {
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
     auto attrList =
         (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attrSize);
-    if (!attrList) die(L"HeapAlloc for attribute list");
+    if (!attrList) return nullptr;
     if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
         HeapFree(GetProcessHeap(), 0, attrList);
-        die(L"InitializeProcThreadAttributeList");
+        return nullptr;
     }
 
-    // Build capability list. If network restriction is NOT requested, grant
-    // the internetClient capability so the child can connect normally.
-    // Otherwise, zero capabilities: outbound TCP is blocked at the kernel.
     SECURITY_CAPABILITIES secCaps = {};
     secCaps.AppContainerSid = sid;
 
     SID_AND_ATTRIBUTES capAttrs[1] = {};
     BYTE capSidBuf[SECURITY_MAX_SID_SIZE];
-    if (!cfg.needsNetworkRestriction) {
+    if (grantInternet) {
         DWORD sidSize = sizeof(capSidBuf);
         if (CreateWellKnownSid(WinCapabilityInternetClientSid, nullptr,
                                capSidBuf, &sidSize)) {
@@ -682,33 +841,25 @@ static DWORD spawnInContainer(PSID sid, const Config& cfg) {
             sizeof(secCaps), nullptr, nullptr)) {
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);
-        die(L"UpdateProcThreadAttribute(SECURITY_CAPABILITIES)");
+        return nullptr;
     }
 
-    std::wstring envBlock = buildEnvBlock(cfg.env);
+    std::wstring envBlock = buildEnvBlock(envOverrides);
 
     STARTUPINFOEXW siex = {};
     siex.StartupInfo.cb = sizeof(siex);
     siex.lpAttributeList = attrList;
 
     PROCESS_INFORMATION pi = {};
-
-    // CreateProcessW mutates lpCommandLine, so copy to a writable buffer.
-    std::wstring cmdline = cfg.command;
+    std::wstring mutableCmd = cmdline;
 
     BOOL ok = CreateProcessW(
-        nullptr,                  // lpApplicationName — use cmdline's first token
-        &cmdline[0],              // lpCommandLine
-        nullptr,                  // lpProcessAttributes
-        nullptr,                  // lpThreadAttributes
-        TRUE,                     // bInheritHandles — so stdio goes to parent
+        nullptr, &mutableCmd[0], nullptr, nullptr,
+        TRUE,  // inherit handles for stdio
         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-        (LPVOID)envBlock.c_str(), // lpEnvironment
-        nullptr,                  // lpCurrentDirectory — inherit
-        &siex.StartupInfo,
-        &pi);
+        (LPVOID)envBlock.c_str(), nullptr, &siex.StartupInfo, &pi);
 
-    DWORD createErr = GetLastError();
+    DWORD err = GetLastError();
     DeleteProcThreadAttributeList(attrList);
     HeapFree(GetProcessHeap(), 0, attrList);
 
@@ -716,19 +867,45 @@ static DWORD spawnInContainer(PSID sid, const Config& cfg) {
         fwprintf(stderr,
                  L"srt-appcontainer: CreateProcessW failed (error %lu)\n"
                  L"  command: %ls\n",
-                 createErr, cfg.command.c_str());
-        return 127;
+                 err, cmdline.c_str());
+        return nullptr;
     }
-
-    // Forward Ctrl+C to the child: by not calling SetConsoleCtrlHandler we
-    // share the console and both get the signal; the child exits, we fall
-    // through the wait, and run cleanup.
-    WaitForSingleObject(pi.hProcess, INFINITE);
-
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    return pi.hProcess;
+}
+
+// Spawn the in-AC forwarder. Returns its process handle (to be killed when
+// the user command exits) or NULL if no bridge is needed/available.
+static HANDLE spawnForwarder(PSID sid, const Config& cfg, const PipeBridge& br) {
+    if (cfg.forwarderPath.empty()) return nullptr;
+    if (cfg.httpProxyPort <= 0 && cfg.socksProxyPort <= 0) return nullptr;
+
+    // In-container ports: fixed, mirror Linux's socat bridge.
+    const int inHttpPort  = cfg.httpProxyPort  > 0 ? 3128 : 0;
+    const int inSocksPort = cfg.socksProxyPort > 0 ? 1080 : 0;
+
+    wchar_t httpPortStr[8], socksPortStr[8];
+    _itow_s(inHttpPort,  httpPortStr,  10);
+    _itow_s(inSocksPort, socksPortStr, 10);
+
+    std::wstring cmd = L"\"" + cfg.forwarderPath + L"\" " +
+                       httpPortStr  + L" " + br.httpPipeName  + L" " +
+                       socksPortStr + L" " + br.socksPipeName;
+
+    // Forwarder gets no env overrides (it doesn't care about HTTP_PROXY) and
+    // no internetClient (same network restriction as the user command).
+    return spawnInContainerRaw(sid, cmd, {}, false);
+}
+
+static DWORD spawnUserCommand(PSID sid, const Config& cfg) {
+    HANDLE proc = spawnInContainerRaw(sid, cfg.command, cfg.env,
+                                      !cfg.needsNetworkRestriction);
+    if (!proc) return 127;
+
+    WaitForSingleObject(proc, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(proc, &exitCode);
+    CloseHandle(proc);
     return exitCode;
 }
 
@@ -739,14 +916,21 @@ static DWORD spawnInContainer(PSID sid, const Config& cfg) {
 
 static volatile PSID g_sid = nullptr;
 static const Config* g_cfg = nullptr;
-static volatile bool g_loopbackSet = false;
+static PipeBridge* g_bridge = nullptr;
+static volatile HANDLE g_forwarderProc = nullptr;
 
 static void cleanup() {
     if (!g_sid || !g_cfg) return;
     PSID sid = (PSID)g_sid;
     for (const auto& p : g_cfg->allowWrite) removeAcesForSid(p, sid);
     for (const auto& p : g_cfg->denyRead)   removeAcesForSid(p, sid);
-    if (g_loopbackSet) disableLoopback(sid);
+    if (!g_cfg->forwarderPath.empty()) removeAcesForSid(g_cfg->forwarderPath, sid);
+    if (g_forwarderProc) {
+        TerminateProcess((HANDLE)g_forwarderProc, 0);
+        CloseHandle((HANDLE)g_forwarderProc);
+        g_forwarderProc = nullptr;
+    }
+    if (g_bridge) stopPipeBridge(g_bridge);
     deleteProfile(g_cfg->profileName);
     if (!g_cfg->sidecarPath.empty()) DeleteFileW(g_cfg->sidecarPath.c_str());
     g_sid = nullptr;
@@ -787,7 +971,6 @@ static int sweep(const wchar_t* sidecarPath) {
     for (const auto& ace : sc.aces) {
         removeAcesForSid(ace.second, sid);
     }
-    disableLoopback(sid);
     deleteProfile(sc.profileName);
     LocalFree(sid);
     DeleteFileW(sidecarPath);
@@ -902,31 +1085,58 @@ int wmain(int argc, wchar_t** argv) {
         LocalFree(dsd);
     }
 
-    // 4. Loopback exemption (only if network restriction active — otherwise
-    // we granted internetClient and the child has full network anyway).
-    if (cfg.needsNetworkRestriction) {
-        if (enableLoopback(sid)) {
-            g_loopbackSet = true;
-        } else {
-            // Fail closed: network restriction was requested but the child
-            // won't be able to reach the proxy. enableLoopback already
-            // printed instructions.
+    // 4. Start the pipe bridge (only if network restriction active —
+    // otherwise we granted internetClient and the child has full network).
+    // The bridge is ephemeral: named pipes are kernel objects that vanish
+    // when the process exits, so nothing persists for the sweep to undo.
+    static PipeBridge bridge;
+    if (cfg.needsNetworkRestriction &&
+        (cfg.httpProxyPort > 0 || cfg.socksProxyPort > 0)) {
+        if (!startPipeBridge(&bridge, sid, cfg.profileName,
+                             cfg.httpProxyPort, cfg.socksProxyPort)) {
+            fwprintf(stderr,
+                     L"srt-appcontainer: failed to start pipe bridge\n");
             cleanup();
             if (sidStr) LocalFree(sidStr);
             FreeSid(sid);
             return 126;
         }
+        g_bridge = &bridge;
+
+        // The forwarder binary may live in a user-profile install dir
+        // (scoop, npx) that lacks the ALL APPLICATION PACKAGES SID — the
+        // AppContainer wouldn't be able to read/execute it. Grant
+        // read+execute to our SID. Recorded in the sidecar so sweep undoes it.
+        if (!cfg.forwarderPath.empty()) {
+            if (addAce(cfg.forwarderPath, sid, GRANT_ACCESS,
+                       GENERIC_READ | GENERIC_EXECUTE)) {
+                sc.aces.push_back({L'G', cfg.forwarderPath});
+            }
+        }
     }
 
-    // 5. Write sidecar so a future sweep can undo steps 2-4 if we crash now.
+    // 5. Write sidecar so a future sweep can undo steps 2-3 if we crash now.
     if (!cfg.sidecarPath.empty()) {
         writeSidecar(cfg.sidecarPath, sc);
     }
 
     if (sidStr) LocalFree(sidStr);
 
-    // 6-7. Spawn and wait.
-    DWORD exitCode = spawnInContainer(sid, cfg);
+    // 6. Spawn the in-container forwarder (if bridge is active). It runs
+    // alongside the user command and is killed when the command exits.
+    if (g_bridge) {
+        g_forwarderProc = spawnForwarder(sid, cfg, bridge);
+        if (!g_forwarderProc) {
+            fwprintf(stderr,
+                     L"srt-appcontainer: failed to spawn forwarder; "
+                     L"network access via proxy will not work\n");
+            // Not fatal — fs sandboxing still works. The user command's
+            // HTTP_PROXY connect will just fail.
+        }
+    }
+
+    // 7. Spawn user command and wait.
+    DWORD exitCode = spawnUserCommand(sid, cfg);
 
     // 8. Revoke everything.
     cleanup();

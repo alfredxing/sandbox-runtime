@@ -46,16 +46,16 @@ export interface WindowsSandboxParams {
 const pendingConfigFiles = new Set<string>()
 
 /**
- * Locate the vendored srt-appcontainer.exe helper.
+ * Locate a vendored AppContainer binary (helper or forwarder).
  *
  * Mirrors the three-candidate search pattern used by generate-seccomp-filter.ts
  * for the Linux apply-seccomp binary: bundled-alongside, package-root, dist/.
  */
-export function getAppContainerHelperPath(): string | null {
+function findVendoredBinary(filename: string): string | null {
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
 
   const baseDir = dirname(fileURLToPath(import.meta.url))
-  const rel = join('vendor', 'appcontainer', arch, 'srt-appcontainer.exe')
+  const rel = join('vendor', 'appcontainer', arch, filename)
 
   const candidates = [
     join(baseDir, rel), // bundled alongside (e.g. when bundled into a consumer)
@@ -67,6 +67,14 @@ export function getAppContainerHelperPath(): string | null {
     if (existsSync(c)) return c
   }
   return null
+}
+
+export function getAppContainerHelperPath(): string | null {
+  return findVendoredBinary('srt-appcontainer.exe')
+}
+
+export function getPipeForwarderPath(): string | null {
+  return findVendoredBinary('srt-pipe-forwarder.exe')
 }
 
 export function checkWindowsDependencies(): SandboxDependencyCheck {
@@ -214,11 +222,10 @@ export async function wrapCommandWithSandboxWindows(
   const allowWrite = resolvePathsForAcl(allowWriteInput)
 
   // --- denyRead + mandatory denies ------------------------------------------
-  // AppContainer grants read via the ALL APPLICATION PACKAGES SID by default.
-  // Explicit DENY ACEs on denyRead paths override that. Mandatory deny paths
-  // (found by scanning for .gitconfig, .bashrc, etc.) also go here — an
-  // AppContainer DENY ACE blocks both read AND write because the helper sets
-  // DENY on GENERIC_READ|GENERIC_WRITE.
+  // The helper strips the AppContainer SID's inherited ALLOW from each
+  // denyRead path and protects the DACL from re-inheritance, which blocks
+  // both read and write (AppContainer access checks ignore DENY ACEs, so we
+  // remove the ALLOW instead). Cleanup restores inheritance via UNPROTECTED.
   const denyReadInput: string[] = []
   if (readConfig) {
     denyReadInput.push(...readConfig.denyOnly)
@@ -250,7 +257,18 @@ export async function wrapCommandWithSandboxWindows(
   // --- env ------------------------------------------------------------------
   // generateProxyEnvVars returns ["KEY=value", ...]. The helper merges these
   // on top of its inherited environment.
-  const env = generateProxyEnvVars(httpProxyPort, socksProxyPort)
+  //
+  // When network restriction is active, the pipe bridge exposes fixed
+  // in-container ports (3128 http, 1080 socks) that map to the real proxy
+  // ports via the helper's pipe→TCP forwarding. The env vars must point at
+  // the in-container ports, not the host proxy ports (which are unreachable
+  // from inside the AppContainer).
+  const bridgeActive =
+    needsNetworkRestriction && (httpProxyPort || socksProxyPort)
+  const env = generateProxyEnvVars(
+    bridgeActive && httpProxyPort ? 3128 : httpProxyPort,
+    bridgeActive && socksProxyPort ? 1080 : socksProxyPort,
+  )
 
   // --- child command line ---------------------------------------------------
   // The helper passes `command` straight to CreateProcessW. We want cmd.exe
@@ -266,6 +284,14 @@ export async function wrapCommandWithSandboxWindows(
   const childCmd = `${cmdQuote(comspec)} /d /s /c "${command}"`
 
   // --- write config + return ------------------------------------------------
+  const forwarderPath = bridgeActive ? getPipeForwarderPath() : null
+  if (bridgeActive && !forwarderPath) {
+    throw new Error(
+      'srt-pipe-forwarder.exe not found in vendor/appcontainer/. ' +
+        'Build it with: .\\scripts\\build-appcontainer-binary.ps1',
+    )
+  }
+
   const helperConfig = {
     profileName,
     command: childCmd,
@@ -274,6 +300,11 @@ export async function wrapCommandWithSandboxWindows(
     denyRead,
     env,
     needsNetworkRestriction,
+    // Host-side proxy ports for the helper's pipe→TCP bridge threads.
+    // Zero means that half of the bridge is disabled.
+    httpProxyPort: bridgeActive ? (httpProxyPort ?? 0) : 0,
+    socksProxyPort: bridgeActive ? (socksProxyPort ?? 0) : 0,
+    forwarderPath: forwarderPath ? resolve(forwarderPath) : '',
   }
 
   writeFileSync(configPath, JSON.stringify(helperConfig), 'utf-8')
