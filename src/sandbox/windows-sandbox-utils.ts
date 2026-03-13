@@ -8,10 +8,12 @@ import {
   writeFileSync,
   rmSync,
   mkdirSync,
+  realpathSync,
 } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 
 import { logForDebugging } from '../utils/debug.js'
+import { whichSync } from '../utils/which.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -164,6 +166,45 @@ function cmdQuote(p: string): string {
   return `"${p}"`
 }
 
+/**
+ * Resolve directories that need an RX grant for the user's binary to launch.
+ *
+ * The AppContainer SID has no read/execute on user-profile dirs (scoop, nvm,
+ * npm-global — no ALL APPLICATION PACKAGES ACE). The helper grants RX so
+ * CreateProcess can map the exe and its adjacent DLLs.
+ *
+ * Returns both the dir-as-found AND the realpath target. Scoop's `current`
+ * is a junction; cmd.exe's PATH stat hits the junction's own DACL, but the
+ * loader follows the junction and then needs RX on the TARGET. ACLs on a
+ * junction don't propagate — both dirs need the grant.
+ *
+ * `command` is the raw user string (before cmd.exe wrapping). First
+ * whitespace-delimited token, stripping quotes. Compound shell (`a && b`)
+ * only resolves `a` — acceptable, the first binary is the entry point.
+ */
+function resolveCommandBinaryDirs(command: string): string[] {
+  const m = command.match(/^\s*(?:"([^"]+)"|(\S+))/)
+  if (!m) return []
+  const tok = m[1] ?? m[2]
+
+  const resolved =
+    tok.includes('\\') || tok.includes('/') ? tok : whichSync(tok)
+  if (!resolved || !existsSync(resolved)) return []
+
+  // System32 already has ALL APPLICATION PACKAGES — skip to avoid ACL churn.
+  if (resolved.toLowerCase().includes('\\windows\\system32\\')) return []
+
+  const dirs = [dirname(resolved)]
+  try {
+    const real = realpathSync(resolved)
+    const realDir = dirname(real)
+    if (realDir !== dirs[0]) dirs.push(realDir)
+  } catch {
+    // realpath failed — still grant the as-found dir
+  }
+  return dirs
+}
+
 export async function wrapCommandWithSandboxWindows(
   params: WindowsSandboxParams,
 ): Promise<string> {
@@ -280,6 +321,11 @@ export async function wrapCommandWithSandboxWindows(
   //     quotes and preserves everything inside, which is exactly what we
   //     want for a command that may itself contain quotes.
   // /c: run and exit
+  const grantExecuteDirs = resolveCommandBinaryDirs(command)
+  for (const d of grantExecuteDirs) {
+    logForDebugging(`Windows AppContainer: granting RX on ${d}`)
+  }
+
   const comspec = process.env.COMSPEC || 'C:\\Windows\\System32\\cmd.exe'
   const childCmd = `${cmdQuote(comspec)} /d /s /c "${command}"`
 
@@ -297,6 +343,7 @@ export async function wrapCommandWithSandboxWindows(
     command: childCmd,
     sidecarPath,
     allowWrite,
+    grantExecuteDirs,
     denyRead,
     env,
     needsNetworkRestriction,

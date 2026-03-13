@@ -13,15 +13,18 @@ export function whichSync(bin: string): string | null {
     return globalThis.Bun.which(bin)
   }
 
-  // Fallback to Node.js implementation
-  const result = spawnSync('which', [bin], {
+  // Fallback to Node.js implementation. `where` on Windows, `which` on POSIX.
+  // `where` returns multiple matches (one per line); take the first.
+  const isWin = process.platform === 'win32'
+  const result = spawnSync(isWin ? 'where' : 'which', [bin], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 1000,
   })
 
   if (result.status === 0 && result.stdout) {
-    return result.stdout.trim()
+    const first = result.stdout.split(/\r?\n/)[0].trim()
+    return first || null
   }
 
   return null

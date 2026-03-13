@@ -25,7 +25,7 @@ $SourceDir = Join-Path $RootDir "vendor\appcontainer-src"
 
 # Binaries to build: (basename, link-libs). All sources are $SourceDir\<basename>.cpp.
 $Binaries = @(
-    @{ Name = "srt-appcontainer";  Libs = @("userenv.lib", "advapi32.lib", "shell32.lib", "ws2_32.lib") },
+    @{ Name = "srt-appcontainer";  Libs = @("userenv.lib", "advapi32.lib", "shell32.lib", "ws2_32.lib", "user32.lib") },
     @{ Name = "srt-pipe-forwarder"; Libs = @("ws2_32.lib") }
 )
 

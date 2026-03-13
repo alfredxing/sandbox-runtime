@@ -85,6 +85,7 @@ struct Config {
     std::wstring command;
     std::wstring sidecarPath;
     std::vector<std::wstring> allowWrite;
+    std::vector<std::wstring> grantExecuteDirs;  // RX-only (binaries outside allowWrite)
     std::vector<std::wstring> denyRead;
     std::vector<std::wstring> env;  // "KEY=value" pairs to override/add
     bool needsNetworkRestriction = true;
@@ -278,6 +279,7 @@ static Config parseConfigFile(const wchar_t* path) {
         else if (key == L"command")                cfg.command     = r.readString();
         else if (key == L"sidecarPath")            cfg.sidecarPath = r.readString();
         else if (key == L"allowWrite")             cfg.allowWrite  = r.readStringArray();
+        else if (key == L"grantExecuteDirs")       cfg.grantExecuteDirs = r.readStringArray();
         else if (key == L"denyRead")               cfg.denyRead    = r.readStringArray();
         else if (key == L"env")                    cfg.env         = r.readStringArray();
         else if (key == L"needsNetworkRestriction") cfg.needsNetworkRestriction = r.readBool();
@@ -799,6 +801,141 @@ static std::wstring buildEnvBlock(const std::vector<std::wstring>& overrides) {
     return block;
 }
 
+
+// ---------------------------------------------------------------------------
+// Alternate desktop inside WinSta0
+//
+// USER32.dll's DllMain binds to a window station + desktop via win32k.
+// LowBox tokens can't open WinSta0\Default — any binary importing USER32
+// (node, python, most things that aren't API-set-only like curl) dies with
+// STATUS_DLL_INIT_FAILED before main().
+//
+// Fix: create a dedicated desktop inside the current WinSta0 with the
+// container SID in its DACL, and add a container-SID ACE to WinSta0 itself
+// (USER32 opens BOTH the station and the desktop). Creating a whole new
+// window station (CreateWindowStationW) also works but returns
+// ERROR_ACCESS_DENIED in some non-admin contexts — session 0, certain
+// RDP/TS configs. Creating a desktop in the existing station only needs
+// DESKTOP_CREATEWINDOW which standard users have.
+//
+// Cleanup: the desktop handle closes with the helper. The WinSta0 ACE is
+// revoked in cleanup(); if the helper crashes, the ACE references a SID
+// whose AppContainer profile gets deleted by sweep, rendering it inert.
+// WinSta0 itself is session-scoped — logoff wipes it anyway.
+// ---------------------------------------------------------------------------
+
+struct AltDesktop {
+    HDESK desk = nullptr;
+    HWINSTA winsta0 = nullptr;  // for DACL revoke in cleanup
+    PSID containerSid = nullptr;
+    std::wstring name;  // just "desk" — no winsta\ prefix means current station
+};
+
+static bool createAltDesktop(PSID containerSid, const std::wstring& profileName,
+                             AltDesktop* out) {
+    // Desktop SD: container SID + current user, both GENERIC_ALL.
+    HANDLE tok; OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok);
+    DWORD userLen = 0;
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &userLen);
+    auto userBuf = (PTOKEN_USER)LocalAlloc(LPTR, userLen);
+    GetTokenInformation(tok, TokenUser, userBuf, userLen, &userLen);
+    CloseHandle(tok);
+
+    EXPLICIT_ACCESS_W ea[2] = {};
+    ea[0].grfAccessPermissions = GENERIC_ALL;
+    ea[0].grfAccessMode = GRANT_ACCESS;
+    ea[0].grfInheritance = NO_INHERITANCE;
+    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    ea[0].Trustee.ptstrName = (LPWSTR)containerSid;
+    ea[1] = ea[0];
+    ea[1].Trustee.ptstrName = (LPWSTR)userBuf->User.Sid;
+
+    PACL dacl = nullptr;
+    if (SetEntriesInAclW(2, ea, nullptr, &dacl) != ERROR_SUCCESS) {
+        LocalFree(userBuf);
+        return false;
+    }
+    LocalFree(userBuf);
+
+    PSECURITY_DESCRIPTOR sd = LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
+    InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(sd, TRUE, dacl, FALSE);
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
+
+    std::wstring dkName = profileName + L"-dk";
+
+    // Desktop is created in the CURRENT process's window station (WinSta0
+    // for an interactive user). No SetProcessWindowStation dance.
+    HDESK dk = CreateDesktopW(dkName.c_str(), nullptr, nullptr, 0,
+                              DESKTOP_CREATEWINDOW | DESKTOP_READOBJECTS |
+                              DESKTOP_WRITEOBJECTS | DESKTOP_ENUMERATE |
+                              DESKTOP_CREATEMENU, &sa);
+    LocalFree(sd); LocalFree(dacl);
+
+    if (!dk) {
+        fwprintf(stderr, L"srt-appcontainer: CreateDesktop failed (%lu)\n",
+                 GetLastError());
+        return false;
+    }
+
+    // WinSta0 also needs a container-SID ACE — USER32 opens the process's
+    // window station AND desktop. The user owns WinSta0 so WRITE_DAC is
+    // implicit. Minimal access mask — the container doesn't need to
+    // create more desktops or read the clipboard.
+    HWINSTA ws0 = GetProcessWindowStation();
+    EXPLICIT_ACCESS_W wea = {};
+    wea.grfAccessPermissions = WINSTA_ENUMDESKTOPS | WINSTA_READATTRIBUTES |
+                               WINSTA_ACCESSGLOBALATOMS | WINSTA_ENUMERATE;
+    wea.grfAccessMode = GRANT_ACCESS;
+    wea.grfInheritance = NO_INHERITANCE;
+    wea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    wea.Trustee.ptstrName = (LPWSTR)containerSid;
+
+    PACL wOld, wNew; PSECURITY_DESCRIPTOR wSd;
+    DWORD e1 = GetSecurityInfo(ws0, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                               nullptr, nullptr, &wOld, nullptr, &wSd);
+    if (e1 != ERROR_SUCCESS) {
+        fwprintf(stderr, L"srt-appcontainer: GetSecurityInfo WinSta0 failed (%lu)\n", e1);
+        CloseDesktop(dk);
+        return false;
+    }
+    SetEntriesInAclW(1, &wea, wOld, &wNew);
+    DWORD e2 = SetSecurityInfo(ws0, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                               nullptr, nullptr, wNew, nullptr);
+    LocalFree(wSd); LocalFree(wNew);
+    if (e2 != ERROR_SUCCESS) {
+        fwprintf(stderr, L"srt-appcontainer: SetSecurityInfo WinSta0 failed (%lu)\n", e2);
+        CloseDesktop(dk);
+        return false;
+    }
+
+    out->desk = dk;
+    out->winsta0 = ws0;
+    out->containerSid = containerSid;
+    out->name = dkName;  // no "winsta\" — lpDesktop uses current station
+    return true;
+}
+
+static void closeAltDesktop(AltDesktop* ad) {
+    // Revoke the WinSta0 ACE we added.
+    if (ad->winsta0 && ad->containerSid) {
+        EXPLICIT_ACCESS_W rev = {};
+        rev.grfAccessMode = REVOKE_ACCESS;
+        rev.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        rev.Trustee.ptstrName = (LPWSTR)ad->containerSid;
+        PACL wOld, wNew; PSECURITY_DESCRIPTOR wSd;
+        if (GetSecurityInfo(ad->winsta0, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, &wOld, nullptr, &wSd) == ERROR_SUCCESS) {
+            SetEntriesInAclW(1, &rev, wOld, &wNew);
+            SetSecurityInfo(ad->winsta0, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION,
+                            nullptr, nullptr, wNew, nullptr);
+            LocalFree(wSd); LocalFree(wNew);
+        }
+        ad->winsta0 = nullptr;
+    }
+    if (ad->desk) { CloseDesktop(ad->desk); ad->desk = nullptr; }
+}
+
 // ---------------------------------------------------------------------------
 // Spawn inside AppContainer
 // ---------------------------------------------------------------------------
@@ -810,7 +947,8 @@ static std::wstring buildEnvBlock(const std::vector<std::wstring>& overrides) {
 static HANDLE spawnInContainerRaw(PSID sid, const std::wstring& cmdline,
                                   const std::vector<std::wstring>& envOverrides,
                                   bool grantInternet,
-                                  const wchar_t* cwd) {
+                                  const wchar_t* cwd,
+                                  wchar_t* lpDesktop) {
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
     auto attrList =
@@ -849,6 +987,7 @@ static HANDLE spawnInContainerRaw(PSID sid, const std::wstring& cmdline,
 
     STARTUPINFOEXW siex = {};
     siex.StartupInfo.cb = sizeof(siex);
+    siex.StartupInfo.lpDesktop = lpDesktop;
     siex.lpAttributeList = attrList;
 
     PROCESS_INFORMATION pi = {};
@@ -895,10 +1034,11 @@ static HANDLE spawnForwarder(PSID sid, const Config& cfg, const PipeBridge& br) 
 
     // Forwarder gets no env overrides (it doesn't care about HTTP_PROXY) and
     // no internetClient (same network restriction as the user command).
-    return spawnInContainerRaw(sid, cmd, {}, false, nullptr);
+    // No USER32 in the forwarder (ws2_32-only link) — doesn't need the alt desktop.
+    return spawnInContainerRaw(sid, cmd, {}, false, nullptr, nullptr);
 }
 
-static DWORD spawnUserCommand(PSID sid, const Config& cfg) {
+static DWORD spawnUserCommand(PSID sid, const Config& cfg, wchar_t* lpDesktop) {
     // lpCurrentDirectory: use allowWrite[0]. Inheriting the caller's cwd
     // fails when the caller is in a directory the container SID can't
     // read (LowBox tokens strip SeChangeNotifyPrivilege, so even
@@ -910,7 +1050,8 @@ static DWORD spawnUserCommand(PSID sid, const Config& cfg) {
     const wchar_t* cwd =
         cfg.allowWrite.empty() ? nullptr : cfg.allowWrite.front().c_str();
     HANDLE proc = spawnInContainerRaw(sid, cfg.command, cfg.env,
-                                      !cfg.needsNetworkRestriction, cwd);
+                                      !cfg.needsNetworkRestriction, cwd,
+                                      lpDesktop);
     if (!proc) return 127;
 
     WaitForSingleObject(proc, INFINITE);
@@ -929,12 +1070,15 @@ static volatile PSID g_sid = nullptr;
 static const Config* g_cfg = nullptr;
 static PipeBridge* g_bridge = nullptr;
 static volatile HANDLE g_forwarderProc = nullptr;
+static AltDesktop g_altDesktop;
 
 static void cleanup() {
     if (!g_sid || !g_cfg) return;
     PSID sid = (PSID)g_sid;
-    for (const auto& p : g_cfg->allowWrite) removeAcesForSid(p, sid);
-    for (const auto& p : g_cfg->denyRead)   removeAcesForSid(p, sid);
+    for (const auto& p : g_cfg->allowWrite)       removeAcesForSid(p, sid);
+    for (const auto& p : g_cfg->grantExecuteDirs) removeAcesForSid(p, sid);
+    for (const auto& p : g_cfg->denyRead)         removeAcesForSid(p, sid);
+    closeAltDesktop(&g_altDesktop);
     if (!g_cfg->forwarderPath.empty()) removeAcesForSid(g_cfg->forwarderPath, sid);
     if (g_forwarderProc) {
         TerminateProcess((HANDLE)g_forwarderProc, 0);
@@ -1017,6 +1161,16 @@ int wmain(int argc, wchar_t** argv) {
     g_sid = sid;
     g_cfg = &cfg;
 
+    // 1.5. Create the alternate window station + desktop. USER32.dll's
+    // DllMain fails against WinSta0\\Default under a LowBox token — see
+    // createAltDesktop(). Done early so cleanup() can close the handles
+    // regardless of which later step fails.
+    if (!createAltDesktop(sid, cfg.profileName, &g_altDesktop)) {
+        deleteProfile(cfg.profileName);
+        FreeSid(sid);
+        return 127;
+    }
+
     wchar_t* sidStr = nullptr;
     ConvertSidToStringSidW(sid, &sidStr);
 
@@ -1031,6 +1185,18 @@ int wmain(int argc, wchar_t** argv) {
     for (const auto& p : cfg.allowWrite) {
         if (addAce(p, sid, GRANT_ACCESS,
                    GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | DELETE)) {
+            sc.aces.push_back({L'G', p});
+        } else {
+            anyGrantFailed = true;
+        }
+    }
+
+    // 2.5. Grant read+execute on directories containing the user's
+    // binary (resolved in TS via whichSync → realpath → dirname). Same
+    // mechanism as the forwarder grant below — binaries under scoop/nvm/
+    // npm-global have no ALL APPLICATION PACKAGES ACE.
+    for (const auto& p : cfg.grantExecuteDirs) {
+        if (addAce(p, sid, GRANT_ACCESS, GENERIC_READ | GENERIC_EXECUTE)) {
             sc.aces.push_back({L'G', p});
         } else {
             anyGrantFailed = true;
@@ -1147,7 +1313,10 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     // 7. Spawn user command and wait.
-    DWORD exitCode = spawnUserCommand(sid, cfg);
+    // Mutable copy — lpDesktop is LPWSTR (not const).
+    std::wstring deskName = g_altDesktop.name;
+    DWORD exitCode = spawnUserCommand(sid, cfg,
+        deskName.empty() ? nullptr : &deskName[0]);
 
     // 8. Revoke everything.
     cleanup();
