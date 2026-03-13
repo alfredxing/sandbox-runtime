@@ -444,8 +444,10 @@ static void removeAcesForSid(const std::wstring& path, PSID sid) {
         AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, hdr->AceSize);
     }
 
+    // UNPROTECTED restores inheritance on paths where addAce used PROTECTED.
     SetNamedSecurityInfoW((LPWSTR)path.c_str(), SE_FILE_OBJECT,
-                          DACL_SECURITY_INFORMATION, nullptr, nullptr, newDacl,
+                          DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                          nullptr, nullptr, newDacl,
                           nullptr);
     LocalFree(newDacl);
     LocalFree(sd);
@@ -841,16 +843,63 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
 
-    // 3. Deny ACLs on denyRead paths. DENY ACEs precede ALLOW ACEs in
-    // canonical DACL order, so this overrides any inherited read grant.
+    // 3. Deny access on denyRead paths.
+    //
+    // AppContainer access checks do not honour DENY ACEs in the normal way.
+    // Instead we remove the AppContainer SID's inherited ALLOW from the
+    // file's DACL and protect it from re-inheriting.  Without an ALLOW for
+    // the AppContainer SID (or ALL APPLICATION PACKAGES), the AppContainer
+    // access check fails and access is denied.
+    //
+    // Cleanup (removeAcesForSid) sets UNPROTECTED, which re-enables
+    // inheritance and restores the original DACL.
     for (const auto& p : cfg.denyRead) {
-        if (addAce(p, sid, DENY_ACCESS, GENERIC_READ | GENERIC_WRITE)) {
-            sc.aces.push_back({L'D', p});
+        // Read current DACL, rebuild without our SID, set with PROTECTED.
+        PACL oldDacl = nullptr;
+        PSECURITY_DESCRIPTOR dsd = nullptr;
+        DWORD derr = GetNamedSecurityInfoW(p.c_str(), SE_FILE_OBJECT,
+                                           DACL_SECURITY_INFORMATION, nullptr,
+                                           nullptr, &oldDacl, nullptr, &dsd);
+        if (derr != ERROR_SUCCESS || oldDacl == nullptr) {
+            if (dsd) LocalFree(dsd);
+            continue;
         }
-        // A deny that fails to apply is not fatal — it means the path
-        // doesn't exist or we lack WRITE_DAC. The child still can't write
-        // (deny-by-default), it just might be able to read. We recorded
-        // nothing in the sidecar so sweep won't try to undo.
+
+        ACL_SIZE_INFORMATION dsi = {};
+        GetAclInformation(oldDacl, &dsi, sizeof(dsi), AclSizeInformation);
+
+        DWORD newSz = sizeof(ACL);
+        std::vector<LPVOID> keep;
+        for (DWORD i = 0; i < dsi.AceCount; i++) {
+            LPVOID ace = nullptr;
+            if (!GetAce(oldDacl, i, &ace)) continue;
+            PACE_HEADER hdr = (PACE_HEADER)ace;
+            PSID aceSid = (PSID)&((PACCESS_ALLOWED_ACE)ace)->SidStart;
+            if (EqualSid(aceSid, sid)) continue;  // skip our SID
+            keep.push_back(ace);
+            newSz += hdr->AceSize;
+        }
+
+        PACL newDacl = (PACL)LocalAlloc(LPTR, newSz);
+        if (newDacl) {
+            InitializeAcl(newDacl, newSz, ACL_REVISION);
+            for (LPVOID ace : keep) {
+                PACE_HEADER hdr = (PACE_HEADER)ace;
+                AddAce(newDacl, ACL_REVISION, MAXDWORD, ace, hdr->AceSize);
+            }
+
+            derr = SetNamedSecurityInfoW(
+                (LPWSTR)p.c_str(), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                nullptr, nullptr, newDacl, nullptr);
+
+            LocalFree(newDacl);
+
+            if (derr == ERROR_SUCCESS) {
+                sc.aces.push_back({L'D', p});
+            }
+        }
+        LocalFree(dsd);
     }
 
     // 4. Loopback exemption (only if network restriction active — otherwise

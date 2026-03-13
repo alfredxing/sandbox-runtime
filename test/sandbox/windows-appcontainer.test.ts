@@ -180,7 +180,9 @@ describe('windows-appcontainer: integration', () => {
   describe('filesystem', () => {
     it('allows write inside allowWrite', async () => {
       const targetFile = join(testDir, 'out.txt')
-      const cmd = `node -e "require('fs').writeFileSync(${JSON.stringify(targetFile)}, 'ok')"`
+      // Use cmd.exe builtin — node.exe is in a user-profile directory that
+      // the AppContainer cannot read (no ALL APPLICATION PACKAGES SID).
+      const cmd = `echo ok>"${targetFile}"`
 
       const wrapped = await wrapCommandWithSandboxWindows({
         command: cmd,
@@ -192,7 +194,7 @@ describe('windows-appcontainer: integration', () => {
       const { code } = runWrapped(wrapped)
       expect(code).toBe(0)
       expect(existsSync(targetFile)).toBe(true)
-      expect(readFileSync(targetFile, 'utf-8')).toBe('ok')
+      expect(readFileSync(targetFile, 'utf-8')).toContain('ok')
     })
 
     it('blocks write outside allowWrite', async () => {
@@ -200,7 +202,8 @@ describe('windows-appcontainer: integration', () => {
       const otherDir = mkdtempSync(join(tmpdir(), 'srt-other-'))
       const targetFile = join(otherDir, 'blocked.txt')
       try {
-        const cmd = `node -e "try{require('fs').writeFileSync(${JSON.stringify(targetFile)},'x');process.exit(0)}catch(e){console.error(e.code);process.exit(1)}"`
+        // Use cmd.exe builtin — node.exe is inaccessible from AppContainer.
+        const cmd = `echo x>"${targetFile}"`
 
         const wrapped = await wrapCommandWithSandboxWindows({
           command: cmd,
@@ -211,7 +214,7 @@ describe('windows-appcontainer: integration', () => {
 
         const { code, stderr } = runWrapped(wrapped)
         expect(code).toBe(1)
-        expect(stderr).toMatch(/EACCES|EPERM/)
+        expect(stderr).toMatch(/Access is denied|EACCES|EPERM/)
         expect(existsSync(targetFile)).toBe(false)
       } finally {
         rmSync(otherDir, { recursive: true, force: true })
@@ -222,7 +225,8 @@ describe('windows-appcontainer: integration', () => {
       const secretFile = join(testDir, 'secret.txt')
       writeFileSync(secretFile, 'shh')
 
-      const cmd = `node -e "try{console.log(require('fs').readFileSync(${JSON.stringify(secretFile)},'utf8'));process.exit(0)}catch(e){console.error(e.code);process.exit(1)}"`
+      // Use cmd.exe builtin — node.exe is inaccessible from AppContainer.
+      const cmd = `type "${secretFile}"`
 
       const wrapped = await wrapCommandWithSandboxWindows({
         command: cmd,
@@ -234,7 +238,7 @@ describe('windows-appcontainer: integration', () => {
       const { code, stdout, stderr } = runWrapped(wrapped)
       expect(code).toBe(1)
       expect(stdout).not.toContain('shh')
-      expect(stderr).toMatch(/EACCES|EPERM/)
+      expect(stderr).toMatch(/Access is denied|EACCES|EPERM/)
     })
 
     it('denies write to .git/config inside allowWrite (mandatory deny)', async () => {
@@ -246,7 +250,8 @@ describe('windows-appcontainer: integration', () => {
         return
       }
 
-      const cmd = `node -e "try{require('fs').appendFileSync(${JSON.stringify(gitConfig)},'\\n');process.exit(0)}catch(e){console.error(e.code);process.exit(1)}"`
+      // Use cmd.exe builtin — node.exe is inaccessible from AppContainer.
+      const cmd = `echo.>>"${gitConfig}"`
 
       const wrapped = await wrapCommandWithSandboxWindows({
         command: cmd,
@@ -263,7 +268,9 @@ describe('windows-appcontainer: integration', () => {
 
   describe('network', () => {
     it('blocks direct TCP connect without internetClient', async () => {
-      const cmd = `node -e "const s=require('net').connect(443,'1.1.1.1');s.on('error',e=>{console.error(e.code);process.exit(1)});s.on('connect',()=>process.exit(0));setTimeout(()=>process.exit(2),5000)"`
+      // Use PowerShell (system dir, accessible from AppContainer) instead
+      // of node (user-profile dir, not readable from AppContainer).
+      const cmd = `powershell -NoProfile -Command "try { $c = [System.Net.Sockets.TcpClient]::new(); $c.Connect('1.1.1.1', 443); exit 0 } catch { Write-Error $_.Exception.Message; exit 1 }"`
 
       const wrapped = await wrapCommandWithSandboxWindows({
         command: cmd,
@@ -278,7 +285,9 @@ describe('windows-appcontainer: integration', () => {
       // Either way: NOT exit 0 (connect succeeded).
       expect(code).not.toBe(0)
       if (code === 1) {
-        expect(stderr).toMatch(/EACCES|ECONNREFUSED|EPERM/)
+        expect(stderr).toMatch(
+          /Access is denied|EACCES|ECONNREFUSED|EPERM|ActivelyRefused/,
+        )
       }
     })
 
@@ -293,7 +302,9 @@ describe('windows-appcontainer: integration', () => {
       const port = (server.address() as net.AddressInfo).port
 
       try {
-        const cmd = `node -e "const s=require('net').connect(${port},'127.0.0.1');let d='';s.on('data',c=>d+=c);s.on('end',()=>{console.log(d);process.exit(0)});s.on('error',e=>{console.error(e.code);process.exit(1)})"`
+        // Use PowerShell (system dir, accessible from AppContainer) instead
+        // of node (user-profile dir, not readable from AppContainer).
+        const cmd = `powershell -NoProfile -Command "$c = [System.Net.Sockets.TcpClient]::new('127.0.0.1', ${port}); $s = $c.GetStream(); $r = [System.IO.StreamReader]::new($s); $d = $r.ReadToEnd(); Write-Output $d; $c.Close()"`
 
         const wrapped = await wrapCommandWithSandboxWindows({
           command: cmd,
@@ -402,26 +413,39 @@ describe('windows-appcontainer: integration', () => {
         f => f.startsWith('srt-') && f.endsWith('.aclstate'),
       ).length
 
-      // Spawn a long-running sandboxed child, kill the wrapper hard
+      // Spawn a long-running sandboxed child. Use Bun.spawn (async) so we
+      // can check for the sidecar DURING execution, before the helper has a
+      // chance to clean up. A cmd.exe for-loop is used because external
+      // executables (ping, timeout, choice) fail inside the AppContainer.
       const wrapped = await wrapCommandWithSandboxWindows({
-        command: 'ping 127.0.0.1 -n 30',
+        command: 'for /l %i in (1,1,999999999) do @rem',
         needsNetworkRestriction: false,
         readConfig: undefined,
         writeConfig: { allowOnly: [testDir], denyWithinAllow: [] },
       })
 
-      const proc = spawnSync(wrapped, {
-        shell: true,
-        timeout: 500, // kill after 500ms → helper doesn't reach cleanup
+      // Extract helper path and config path from the wrapped command
+      const helperMatch = wrapped.match(/^"([^"]+)"\s+--config\s+"([^"]+)"$/)
+      if (!helperMatch) {
+        throw new Error('Cannot parse wrapped command: ' + wrapped)
+      }
+      const child = Bun.spawn([helperMatch[1], '--config', helperMatch[2]], {
+        stdout: 'pipe',
+        stderr: 'pipe',
       })
-      // Proc was killed by timeout, helper's cleanup didn't run
-      expect(proc.signal ?? proc.status).toBeTruthy()
+
+      // Wait for the helper to set up ACLs and write the sidecar
+      await new Promise(r => setTimeout(r, 3000))
 
       // Now there should be at least one more sidecar
       const sidecarsMid = readdirSync(tmpdir()).filter(
         f => f.startsWith('srt-') && f.endsWith('.aclstate'),
       ).length
       expect(sidecarsMid).toBeGreaterThan(sidecarsBefore)
+
+      // Kill the process tree (simulates a crash)
+      child.kill()
+      await new Promise(r => setTimeout(r, 1000))
 
       // Sweep
       sweepStaleAppContainerState()
